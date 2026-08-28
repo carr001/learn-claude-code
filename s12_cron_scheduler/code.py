@@ -251,8 +251,8 @@ class CronJob:
     id: str
     cron: str
     prompt: str
-    recurring: bool
-    durable: bool
+    recurring: bool # todo 区分是一次性任务还是周期性任务
+    durable: bool # todo 是否持久化
     pending_delivery: bool = False
     last_fired: str | None = None
 
@@ -534,7 +534,7 @@ def restore_cron_jobs(jobs: list[CronJob]):
                 continue
             current.pending_delivery = True
             if current.id not in queued_ids:
-                cron_queue.append(current)
+                cron_queue.append(current) # todo 
                 queued_ids.add(current.id)
 
 

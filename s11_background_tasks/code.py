@@ -93,7 +93,7 @@ def _run_bash_process(command: str) -> tuple[str, int | None]:
         )
         with _shell_process_lock:
             _shell_processes.add(process)
-        stdout, stderr = process.communicate(timeout=120)
+        stdout, stderr = process.communicate(timeout=120)# todo 阻塞等待子进程结束
         output = (stdout + stderr).strip()
         return (output[:50000] if output else "(no output)"), process.returncode
     except subprocess.TimeoutExpired:
