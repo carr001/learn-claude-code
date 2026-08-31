@@ -16,6 +16,14 @@
 5. [s12 是否修改系统 crontab（进程内 cron vs OS 级 cron）](#5-s12-是否修改系统-crontab进程内-cron-vs-os-级-cron)
 6. [创建 cron 的工具：`schedule_cron`（及 list_crons / cancel_cron）](#6-创建-cron-的工具schedule_cron及-list_crons--cancel_cron)
 7. [s13 README "Harness 需要回答一组相互关联的问题" 深度解读](#7-s13-readme-harness-需要回答一组相互关联的问题-深度解读)
+8. [s13 `wait_for_cli_event` 双事件源阻塞器](#8-s13-wait_for_cli_event-双事件源阻塞器)
+9. [s13 Task `owner` 字段的枚举取值](#9-s13-task-owner-字段的枚举取值)
+10. [s13 `MessageBus` 完整解析：文件收件箱通信基础设施](#10-s13-messagebus-完整解析文件收件箱通信基础设施)
+11. [s13 `wait_for_messages` 的动态超时重算逻辑](#11-s13-wait_for_messages-的动态超时重算逻辑)
+12. [s13 `_read_unlocked` 设计解析：破坏性读的最底层原语](#12-s13-_read_unlocked-设计解析破坏性读的最底层原语)
+13. [s16 Workflow Runtime 解决什么问题（举例讲透）](#13-s16-workflow-runtime-解决什么问题举例讲透)
+14. [s15 → s16 演进 HTML 可视化图解](#14-s15--s16-演进-html-可视化图解)
+15. [s17 Goal Loop 讲什么：独立判断器决定 agent 是否真的完成](#15-s17-goal-loop-讲什么独立判断器决定-agent-是否真的完成)
 
 ---
 
@@ -960,11 +968,1079 @@ LLM: cancel_cron(job_id="cron_0001")
 
 ---
 
+## 8. s13 `wait_for_cli_event` 双事件源阻塞器
+
+### 用户
+
+> `wait_for_cli_event` 这个是做什么的？（选中 s13_agent_teams/code.py 第 1817-1833 行）
+
+### 助手
+
+#### 一句话定位
+
+s13 主线程的**"双事件源阻塞器"**——替代普通 `input()`，让主线程能**同时等待两件事的任意一件先发生**：
+
+1. 用户敲键盘输入一行
+2. 后台某个 teammate 往 Lead 的收件箱扔了消息
+
+哪个先到就返回哪个。这是 s13 从"用户驱动的对话 agent"升级为"多 Agent 团队 lead"的**关键 IO 抽象**。
+
+#### 完整代码
+
+```python
+def wait_for_cli_event() -> tuple[str, str | None]:
+    prompt_visible = False
+    while True:
+        if BUS.peek("lead"):                           # ① 收件箱有货?
+            if prompt_visible:
+                print()
+            return "wake", None                        #    → wake 事件
+        if not prompt_visible:
+            print("s13 >> ", end="", flush=True)       # ② 打印提示符
+            prompt_visible = True
+        readable, _, _ = select.select([sys.stdin], [], [], 0.25)   # ③ 等 stdin 或 250ms
+        if readable:
+            line = sys.stdin.readline()                # ④ 读一行
+            if line == "":
+                return "quit", None                    #    → EOF
+            return "user", line.rstrip("\n")           #    → 用户输入
+```
+
+#### 返回值语义（三种事件）
+
+| kind | payload | 触发条件 | 主循环处理 |
+|---|---|---|---|
+| `"user"` | 输入字符串 | 用户敲了一行按了回车 | 追加到 history，跑 agent_loop |
+| `"wake"` | None | Lead 收件箱有消息 | 消费收件箱，注入到下一轮 |
+| `"quit"` | None | stdin 收到 EOF（Ctrl+D） | 退出主循环 |
+
+#### 逐段拆解
+
+**① 事件源优先级：先检查收件箱**
+
+```python
+if BUS.peek("lead"):
+    return "wake", None
+```
+
+`BUS.peek("lead")` 是**非阻塞观察**（第 884 行）：只看收件箱文件是否存在且非空，不读、不删、不移动指针。
+
+**优先级设计**：wake 高于 user——teammate 完成任务或需审批的消息，通常是主循环之前的 agent turn 触发的，有"我发起的东西回来了"的语义连续性。
+
+**② 打印提示符只打一次**
+
+`prompt_visible` 状态位保证 `s13 >> ` 只在整个 while 循环里打印一次（select 每 250ms 醒一次，不加保护会刷屏）。`flush=True` 是必须的，否则 `end=""` 时提示符不会立即显示。
+
+**③ 核心：`select` 非阻塞轮询 stdin（250ms 超时）**
+
+```python
+readable, _, _ = select.select([sys.stdin], [], [], 0.25)
+```
+
+`select.select(rlist, wlist, xlist, timeout)` 语义：
+
+- 监听 rlist 里的 fd 是否有数据可读
+- 最多等 timeout 秒
+- 三种返回：stdin 有数据 / 250ms 到期 / Ctrl+C 打断（外层兜底）
+
+**为什么用 select 不用 input()**：`input()` 永久阻塞——主线程永远无法主动检查收件箱。teammate 完成任务后，用户不敲键盘就永远不会被处理。这是**两个事件源都可能先到**场景的经典难题。
+
+**为什么是 250ms**：响应性与 CPU 占用的平衡点。太短 CPU 空转，太长 wake 延迟明显。250ms 用户几乎感知不到延迟，CPU 一秒醒 4 次几乎无负担。
+
+**④ 读取或退出**
+
+```python
+if readable:
+    line = sys.stdin.readline()
+    if line == "":
+        return "quit", None      # EOF (Ctrl+D)
+    return "user", line.rstrip("\n")
+```
+
+`line == ""` 是 Unix EOF 约定——正常输入至少含 `\n`，空串表示流关闭。用 `rstrip("\n")` 而不是 `strip()` 精准去掉行尾换行，保留用户可能有意义的两端空格。
+
+#### 主循环里的完整使用（第 1842-1867 行）
+
+```python
+while True:
+    kind, payload = wait_for_cli_event()
+    if kind == "quit":
+        break
+    if kind == "user":
+        if payload is None or payload.strip().lower() in {"q", "exit", ""}:
+            break
+        trigger_hooks("UserPromptSubmit", payload)
+        history.append({"role": "user", "content": payload})
+    else:                                      # wake
+        inbox = consume_lead_inbox()
+        if not inbox:
+            continue
+        history.append({
+            "role": "user",
+            "content": format_team_events(inbox),
+        })
+        print(f"[wake: {len(inbox)} team event(s) -> new turn]")
+
+    agent_loop(history)
+    ...
+```
+
+**关键设计**：两种事件源殊途同归——键盘 or 收件箱最终都被塑造成一条 user message 追加 history，统一走 agent_loop。Lead LLM **不需要知道触发它的是键盘还是收件箱**，只需要看 history 最后一条消息做决策。
+
+#### 与 s11/s12 主循环等待机制对比
+
+| 章节 | 等待函数 | 事件源 | 阻塞方式 |
+|---|---|---|---|
+| s11 | `input()` + `inject_background_results` | 用户键盘 + 后台结果（被动等下次输入才注入） | `input()` 完全阻塞 |
+| s12 | `input()` + 后台线程 `run_agent_turn_locked` | 用户键盘 + cron 定时器（后台线程抢占 `agent_lock`） | `input()` 阻塞，cron 靠抢锁 |
+| **s13** | **`wait_for_cli_event`** | **用户键盘 + 收件箱（`select` 多路复用）** | **`select` 250ms 轮询** |
+
+**s13 独特之处**：唯一把两个事件源在**同一个循环**里 select 起来——不依赖后台线程"抢占"，也不让后台结果"傻等到下次输入"。**更接近真正的 event loop**。
+
+#### 为什么用文件轮询而不是 select fd
+
+`select` 在**普通文件**上的行为跨 OS 不一致——Linux 上普通文件总被认为"随时可读"，`select` 立即返回起不到阻塞作用。真要监听文件变化需 `inotify` (Linux) / `kqueue` (macOS) / `ReadDirectoryChangesW` (Windows)——引入平台判断。
+
+**用 peek + 250ms 轮询是最简单可靠的跨平台方案**，代价只是最坏 250ms 延迟，对 LLM agent 秒级响应场景完全够用。
+
+#### 关键设计要点
+
+| # | 设计 | 目的 |
+|---|---|---|
+| 1 | 优先检查收件箱 | wake 优先级高于 user |
+| 2 | `BUS.peek()` 非阻塞观察 | 只查不消费 |
+| 3 | `prompt_visible` 状态位 | 提示符只打印一次 |
+| 4 | `select` + 250ms 超时 | 响应性与 CPU 占用平衡 |
+| 5 | 只监听 stdin，收件箱轮询 | 跨平台可移植 |
+| 6 | 返回 `(kind, payload)` 元组 | 主循环统一分支处理 |
+| 7 | `line == ""` 判断 EOF | Unix 惯例识别 Ctrl+D |
+
+### 一句话总结
+
+`wait_for_cli_event` 是 **s13 主循环的"双事件源阻塞器"**：**每 250ms 用 `select` 醒一次，优先检查 Lead 收件箱——有消息返回 `("wake", None)`；否则检查 stdin 可读——有输入返回 `("user", line)`，EOF 返回 `("quit", None)`**。让 Lead 主线程能**同时监听键盘和后台 teammate 消息**，把 s13 从 s11/s12 的"用户驱动型 agent"升级为"多事件源驱动型 event loop"，是 s13 从单 agent 走向多 agent 团队协作的**关键 IO 抽象**——没有它，Lead 就只能等用户敲一下才能感知一次团队状态，多 Agent 协作的实时性无从谈起。
+
+---
+
+## 9. s13 Task `owner` 字段的枚举取值
+
+### 用户
+
+> owner 有哪些枚举（选中 s13_agent_teams/code.py 第 463 行 `task = load_task(str(assignment["task_id"]))`）
+
+### 助手
+
+#### 类型声明（Task 类第 113-119 行）
+
+```python
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str
+    status: str
+    owner: str | None      # ← 类型:字符串或 None
+    blockedBy: list[str]
+```
+
+**`owner` 是 `str | None`——不是严格 Python enum，只是约定俗成的字符串标签**。
+
+#### 4 种取值分类
+
+| 值 | 语义 | 何时出现 | 代码位置 |
+|---|---|---|---|
+| `None` | **无人认领**（初始 pending 态） | `create_task` 创建时默认 | 第 144 行，第 480 行释放时也置回 |
+| `"lead"` | **Lead agent 自己认领** | Lead 直接跑任务不派发 | 通过 `TeammateAgent(self.name="lead")` 调用 |
+| `"agent"` | **通用兜底名字** | `claim_task/complete_task` 默认参数值 | 第 281/311/814/823 行 |
+| `"<teammate 名字>"` | **具体队友认领** | Lead spawn teammate 后队友用自己 name 认领 | 第 1150/1219/1394 行 |
+
+#### 关键设计观察
+
+**开放式字符串标签，不是封闭枚举**：
+
+- 没有 `class OwnerType(Enum): ...`
+- 没有白名单校验
+- teammate 名字由 Lead spawn 时自由指定（第 1375 行 `spawn_teammate_thread(name: str, ...)`）
+
+**好处**：扩展性强，加新 teammate 就起个名字。**代价**：类型系统提供不了保护，靠代码约定。
+
+#### `"agent"` vs `"lead"` 的微妙区别
+
+- **`"agent"`** 出现在**独立 CLI 工具（run_claim_task/run_complete_task）**默认值里，代表**"通用兜底身份"**
+- **`"lead"`** 是**Team 系统的正式角色名**，Lead 也作为特殊 teammate 参与消息路由（`sender="lead"`, `target="lead"`）
+
+`"lead"` 广泛用在 MessageBus 的 sender/target 字段（第 1015/1060/1066/1088/1092/1105/1450 行），是**协议里的一等公民**；`"agent"` 只出现在 task 相关函数的默认参数里。
+
+#### 判断逻辑速览
+
+代码里对 owner 只做**同一性判断**：
+
+```python
+task.owner is None       # 未认领 → 可 claim
+task.owner is not None   # 已被认领 → 不能重复 claim
+task.owner == owner      # 是"我"认领的 → 校验完成权限
+task.owner != owner      # 不是"我"的 → 拒绝完成
+```
+
+**对具体名字（"lead"/"agent"/"teammate_xxx"）没有做过内容判断**——只关心"是不是同一个 owner 字符串"。印证它是"标签"而非"枚举"的定位。
+
+### 一句话总结
+
+`owner` 是 `str | None` 类型的**字符串标签**（不是严格枚举），4 类取值：**`None`（未认领）/ `"lead"`（Lead 认领）/ `"agent"`（独立 CLI 默认值）/ `"<teammate 名字>"`（多 Agent 模式下队友的 name）**。代码里对它只做同一性判断（`is None` / `== owner`）不做内容判断，是"开放式标签"设计而非封闭枚举——想加新角色直接起名字，代价是类型系统无法校验合法性，全靠代码约定。
+
+---
+
+## 10. s13 `MessageBus` 完整解析：文件收件箱通信基础设施
+
+### 用户
+
+> 解释下 MessageBus 的用法以及用例（选中 s13_agent_teams/code.py 第 843-844 行 `class MessageBus: """Thread-safe file mailboxes with destructive reads."""`）
+
+### 助手
+
+#### 一句话定位
+
+**s13 的核心通信枢纽**——基于文件的、线程安全的消息队列，让 Lead 和多个 teammate agent 在不同线程里可靠地交换消息。文档字符串把三大特征全说透了：**Thread-safe 多线程安全 / file mailboxes 文件存储 / destructive reads 读一次消费掉**。
+
+#### 4 个 API 概览
+
+| 方法 | 用途 | 阻塞? |
+|---|---|---|
+| **`send(from, to, content, ...)`** | 生产者投递消息 | 不阻塞 |
+| **`read_inbox(agent)`** | 消费者取走全部消息（**读完删除**） | 不阻塞 |
+| **`peek(agent)`** | 观察者非破坏性查看（有货吗？） | 不阻塞 |
+| **`wait_for_messages(agent, timeout)`** | 消费者阻塞等待新消息 | **阻塞** |
+
+#### 底层数据模型
+
+每个 agent 一个 `.jsonl` 文件：
+
+```
+mailboxes/
+├── lead.jsonl              ← Lead 的收件箱
+├── backend_engineer.jsonl  ← teammate 的收件箱
+└── ...
+```
+
+每行一条 JSON：
+
+```json
+{"from": "backend_engineer", "to": "lead", "content": "任务已完成",
+ "type": "result", "ts": 1735300000.123, "metadata": {}}
+```
+
+**为什么用 jsonl 而不是 JSON 数组**：`send` 只需 O(1) 追加（`.open("a")`），不用先读再写整个数组。一行 write 是文件系统级原子操作。
+
+#### 4 个方法的实现细节
+
+**① `send`：生产者投递**
+
+```python
+def send(self, from_agent, to_agent, content, msg_type="message", metadata=None):
+    msg = {"from": from_agent, "to": to_agent, "content": content, ...}
+    with self._changed:
+        MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
+        with self._path(to_agent).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(msg, ensure_ascii=True) + "\n")
+        self._changed.notify_all()             # ★ 唤醒所有 wait_for_messages
+```
+
+关键：`open("a")` 追加模式 O(1)，`notify_all` 唤醒等待者。
+
+**② `read_inbox`：破坏性读取**
+
+```python
+def _read_unlocked(self, agent: str) -> list[dict]:
+    inbox = self._path(agent)
+    if not inbox.exists():
+        return []
+    msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+            if line.strip()]
+    inbox.unlink()                             # ★ 读完立即删除文件
+    return msgs
+```
+
+**"destructive reads" 含义**：读完立刻 unlink——同一批消息只被同一个消费者读到一次，保证 exactly-once delivery，无需维护"已读指针"。
+
+**③ `peek`：非破坏性观察**
+
+```python
+def peek(self, agent: str) -> bool:
+    inbox = self._path(agent)
+    return inbox.exists() and inbox.stat().st_size > 0
+```
+
+只查不动，主线程能非阻塞判断"有没有新消息"。
+
+**④ `wait_for_messages`：阻塞式等待（最精妙的部分）**
+
+```python
+def wait_for_messages(self, agent, timeout=None) -> list[dict]:
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with self._changed:
+        while not self.peek(agent):              # ← 防假唤醒
+            remaining = ... deadline - time.monotonic() ...
+            if remaining is not None and remaining <= 0:
+                return []                        # 超时返回空
+            self._changed.wait(remaining)        # ★ 释放锁+睡觉,等 notify
+        return self._read_unlocked(agent)
+```
+
+**`threading.Condition` 机制**：`self._changed = Condition(self._lock)`。`wait(remaining)` 原子地做三件事：释放锁 → 阻塞睡觉 → 被 notify_all 或超时唤醒后重新拿锁。
+
+比"time.sleep(0.5) 循环 peek"精准太多：有消息 → **毫秒级**唤醒；没消息 → **完全不占 CPU**；`while not peek()` 防止假唤醒。
+
+#### 3 个安全设计点
+
+**① 路径穿越防护**
+
+```python
+def _path(self, agent: str) -> Path:
+    if not is_valid_agent_name(agent):
+        raise ValueError(f"Invalid mailbox recipient: {agent!r}")
+    path = (MAILBOX_DIR / f"{agent}.jsonl").resolve()
+    if not path.is_relative_to(MAILBOX_ROOT):
+        raise ValueError(f"Mailbox path escapes directory: {agent!r}")
+    return path
+```
+
+双重防线：名字白名单 + 路径 resolve 后检查——防 LLM prompt injection 产生的恶意 agent 名。
+
+**② `ensure_ascii=True`** 跨编码可移植（CJK 转义为 `\uXXXX`）
+
+**③ `RLock` 可重入锁** 允许同一线程嵌套调用
+
+#### s13 的三大消息流用例
+
+从 17 处 `BUS.*` 调用归纳出三条消息流水：
+
+**用例 1：Lead → Teammate 派发指令（4 处）**
+
+```python
+BUS.send("lead", to, content)                          # 普通消息
+BUS.send("lead", teammate, "...shutdown.", ...)        # 关机命令
+BUS.send("lead", teammate, task, "plan_request")       # 请求计划
+BUS.send("lead", state.sender, content, "plan_approval_response", ...)
+```
+
+**用例 2：Teammate → Lead 汇报（6 处）**
+
+```python
+BUS.send(from_name, "lead", plan, "plan_approval_request", ...)
+BUS.send(self.name, "lead", "Shutdown acknowledged.", ...)
+BUS.send(self.name, "lead", summary, "result")
+BUS.send(self.name, "lead", "Waiting for more work.", ...)
+# 及各种进度上报
+```
+
+**用例 3：主线程等待事件（3 处）**
+
+```python
+# wait_for_cli_event: 非阻塞查询
+if BUS.peek("lead"):
+    return "wake", None
+
+# 主循环: 判断是否所有 teammate 退出
+elif had_teammates and not BUS.peek("lead"):
+    print("[all teammates shut down]")
+
+# teammate 线程等待新任务
+inbox = BUS.wait_for_messages(self.name, IDLE_SCAN_INTERVAL)
+```
+
+#### 通信拓扑图（星型）
+
+```
+                  ┌────────────┐
+                  │ Lead 主线程 │
+                  └──────┬─────┘
+                         │
+          ┌──────────┬───┼───┬──────────┐
+          ▼          ▼       ▼          ▼
+      teammate    ...    ...        teammate
+       线程 A                         线程 N
+          │          │       │          │
+          └──────────┴───┬───┴──────────┘
+                         │ 所有消息经 BUS 转发
+                         ▼
+             ┌────────────────────────┐
+             │ MessageBus (全局单例)   │
+             │ mailboxes/*.jsonl       │
+             └────────────────────────┘
+```
+
+**Lead 和 teammate 从不直接通信**——所有通信都通过 BUS 中转（**星型拓扑**）。好处：Lead 不维护 teammate 引用；teammate 挂了 Lead 不受影响（消息堆在收件箱）；新增 teammate 无需改 Lead 代码。
+
+#### 关键设计要点
+
+| # | 设计 | 目的 |
+|---|---|---|
+| 1 | 每 agent 一个 jsonl 文件 | O(1) 追加,天然分区 |
+| 2 | Destructive reads (读完删) | Exactly-once,无需读指针 |
+| 3 | `Condition + notify_all` | 毫秒级唤醒,0 CPU 空转 |
+| 4 | `while not peek()` 循环 | 防假唤醒 |
+| 5 | 名字白名单 + is_relative_to 双检查 | 路径穿越深度防御 |
+| 6 | `ensure_ascii=True` | 跨编码可移植 |
+| 7 | `RLock` | 允许同线程嵌套 |
+| 8 | 全局单例 `BUS` | Lead + 所有 teammate 共享 |
+
+### 一句话总结
+
+`MessageBus` 是 s13 的**通信基础设施核心**——基于文件的、线程安全的、破坏性读取的多 agent 消息队列。`send` 生产、`read_inbox` 消费（读完自动删除保证 exactly-once）、`peek` 非阻塞观察、`wait_for_messages` 用 `Condition + notify_all` 实现毫秒级唤醒。所有 Lead ↔ teammate 通信都走这个总线（**星型拓扑**），配合每个 agent 独立的 `.jsonl` 文件收件箱，实现了**跨线程可靠、无耦合、无 CPU 空转**的通信协议，是 s13 从单 agent 走向多 Agent 团队协作的**神经系统**。
+
+---
+
+## 11. s13 `wait_for_messages` 的动态超时重算逻辑
+
+### 用户
+
+> 这一段是什么意思？（选中 s13_agent_teams/code.py 第 894-898 行 `wait_for_messages` 的 while 循环判断和 remaining 计算）
+
+### 助手
+
+这 5 行是 `wait_for_messages` 的**"计算还需要等多久"逻辑**——解决多线程编程经典难题：**总超时时间固定，但可能被多次唤醒，每次唤醒后剩余可等待时间要动态重算**。
+
+#### 完整代码（含上下文）
+
+```python
+def wait_for_messages(self, agent, timeout=None) -> list[dict]:
+    deadline = None if timeout is None else time.monotonic() + timeout   # ★ 起点
+    with self._changed:
+        while not self.peek(agent):                                       # ← 选中开始
+            remaining = (None if deadline is None
+                         else deadline - time.monotonic())
+            if remaining is not None and remaining <= 0:
+                return []                                                 # ← 选中结束
+            self._changed.wait(remaining)
+        return self._read_unlocked(agent)
+```
+
+#### 逐行拆解
+
+**第 1 行：`while not self.peek(agent):`**
+
+只要收件箱空就继续循环。用 `while` 而不是 `if` 是**防假唤醒**——`Condition.wait()` 在某些 OS 上偶尔无故被唤醒（spurious wakeup），或被 notify 后消息被别的消费者读走。醒来必须**重新检查条件**。
+
+**第 2-3 行：`remaining = ...` 动态重算**
+
+**为什么每次都要重算，而不是直接 `wait(timeout)`**？
+
+关键场景：假设 `timeout=10, deadline=100`（当前 t=90）：
+
+```
+├─ 第 1 次:remaining=10, wait(10)
+├─ t=93 假唤醒(无消息) → peek False → 继续
+├─ 第 2 次:remaining=7, wait(7)         ← 只等剩余的 7 秒
+├─ t=95 又被假唤醒
+└─ 第 3 次:remaining=5, wait(5)
+```
+
+如果每次都 `wait(10)`：被打断 100 次就永远醒不过来——每次都从"还剩 10 秒"开始等，**总等待成了无限循环**。
+
+**正确做法**：**用绝对时间 `deadline` 作为锚点**，每次用当前时间和 deadline 的差动态算剩余时长——**保证"我说等 10 秒就是最多等 10 秒"的用户契约**。
+
+**第 4-5 行：`if remaining <= 0: return []` 超时兜底**
+
+如果算出剩余时间用光了，直接返回空列表。避免走多余循环迭代（醒来 → peek → 算 → 判断），提前 return 更干净。
+
+`remaining is not None` 判断：兼容 `timeout=None`（永久等待）场景——这时不应触发超时跳出，让代码走到 `wait(None)` 无限等待。
+
+#### 为什么用 `time.monotonic()` 而不是 `time.time()`
+
+```python
+deadline = time.monotonic() + timeout
+```
+
+**`time.monotonic()` 是单调递增时钟**：
+- 永远只增不减（即便系统时间被 NTP 调整或用户改时钟）
+- 单位是秒（float）
+- 原点无意义（不代表 Unix 时间，只算差值用）
+
+**用 `time.time()` 的坑**：墙钟时间可能被 NTP 倒调——回拨 5 秒就多出 5 秒超时。`time.monotonic()` 是 Python 官方推荐的**计时标准做法**。
+
+#### 具体时序案例
+
+`timeout=10, deadline=100`：
+
+| 时刻 | 事件 | remaining | 行为 |
+|---|---|---|---|
+| t=90 | 首次进入 | 10 | wait(10) |
+| t=93 | 假唤醒（无消息） | 7 | wait(7) |
+| t=95 | 别的消费者读走消息 | 5 | wait(5) |
+| t=98 | 终于有消息 | 2 | peek True → 退出 → 读消息返回 |
+
+**总用时 8 秒**，符合 timeout=10 约束。
+
+若无 remaining 动态重算 → 每次 wait 都传 10 → 假唤醒不断重置 → 可能等 30 秒 → 违反用户约定。
+
+#### 关键设计要点
+
+| # | 设计 | 目的 |
+|---|---|---|
+| 1 | `deadline` 用绝对时间锚点 | 无论被唤醒多少次，总超时不变 |
+| 2 | `time.monotonic()` 而非 `time.time()` | 抗系统时钟回拨 |
+| 3 | `while not peek()` 循环判断 | 防假唤醒 + 防条件竞争 |
+| 4 | 每次循环重算 remaining | 让 wait 只等"真正剩余"的时间 |
+| 5 | `remaining <= 0` 提前 return | 避免多余循环迭代 |
+| 6 | `remaining is not None` 兼容永久等待 | 支持 timeout=None 场景 |
+
+### 一句话总结
+
+这 5 行代码实现了**"动态计算剩余可等时间"**的关键逻辑：**用绝对时间 deadline 作为超时锚点，每次循环用 `deadline - time.monotonic()` 计算剩余可等秒数，用光了 `return []`**。解决了"多次唤醒后总超时不能被重置"的经典多线程难题，配合 `time.monotonic()` 抗时钟回拨、`while not peek()` 防假唤醒，实现了**精确、鲁棒、可预测的阻塞等待语义**——这是 Python 标准库 `threading.Condition` 阻塞等待的**教科书级写法**。
+
+---
+
+## 12. s13 `_read_unlocked` 设计解析：破坏性读的最底层原语
+
+### 用户
+
+> 解释下 `_read_unlocked` 的设计（选中 s13_agent_teams/code.py 第 858-865 行）
+
+### 助手
+
+#### 完整代码
+
+```python
+def _read_unlocked(self, agent: str) -> list[dict]:
+    inbox = self._path(agent)
+    if not inbox.exists():
+        return []
+    msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+            if line.strip()]
+    inbox.unlink()
+    return msgs
+```
+
+#### 一句话定位
+
+**"以文件为单位、破坏性地一次性读走某个 agent 收件箱内所有消息"**。方法名前缀 `_` 表示私有，后缀 `_unlocked` 明确告诉调用者**"这个方法内部不加锁，必须外部持锁调用"**。
+
+#### 3 个关键设计维度
+
+**维度 1：命名约定 —— `_unlocked` 后缀的深意**
+
+Python 并发编程"锁契约命名"惯例：
+
+- 带 `_unlocked` 后缀 = "我不加锁，你确保调用时已持锁"
+- 不带 = "我自加锁"
+
+对比 MessageBus 的两个上层方法：
+
+```python
+def read_inbox(self, agent: str) -> list[dict]:      # 公开 API,自加锁
+    with self._lock:
+        return self._read_unlocked(agent)             # ← 复用逻辑
+
+def wait_for_messages(self, agent, timeout=None):
+    with self._changed:                                # 外部已持锁
+        while not self.peek(agent):
+            ...
+        return self._read_unlocked(agent)             # ← 无需再加锁
+```
+
+**为什么拆出 `_unlocked` 版**：如果读逻辑本身加锁，`wait_for_messages` 里会形成"锁的嵌套"——虽然 `RLock` 可重入不死锁，但增加不必要开销。**拆出无锁版让不同上下文按需组合**——Java `Vector`、C++ STL、Linux kernel 都用过的经典模式。
+
+**维度 2：破坏性读（destructive read）—— 语义核心**
+
+```python
+msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        if line.strip()]
+inbox.unlink()                    # ★ 读完立即删除整个文件
+```
+
+`unlink()` 是整段代码**最重要的一行**。
+
+传统方案 vs s13 方案：
+
+| 传统方案 | s13 方案 |
+|---|---|
+| 维护"已读指针" | 读完直接删文件 |
+| 需额外元数据存储 | 无元数据 |
+| 需处理多消费者指针推进 | 天然独占（读到=拥有全部） |
+| 需防重复消费 | 物理删除天然防重复 |
+
+**破坏性读的三个直接好处**：
+
+1. **Exactly-once 语义**：同一批消息只被读到一次
+2. **无状态**：不需维护"已读到哪里"的持久化状态，重启行为一致
+3. **自然清理**：消息读走后文件消失，磁盘不膨胀
+
+**代价**：读取失败无法回滚（`unlink` 后代码崩就丢消息）。s13 接受了这个代价——它是"尽力而为"的通信系统，LLM agent 挂了整个 turn 都要重来，丢消息不是最大问题。
+
+**维度 3：存在性检查 + 空行过滤 —— 边界条件的严谨**
+
+```python
+if not inbox.exists():
+    return []
+```
+
+**为什么先检查存在**：大多数时候文件不存在（agent 还没收到消息或上次读走后没新消息）。直接 `read_text()` 会抛 `FileNotFoundError`。"没消息"不算异常，用条件判断而非 try/except **语义更清晰**。
+
+```python
+msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        if line.strip()]
+```
+
+**为什么 `if line.strip()` 过滤**：
+
+- `read_text().splitlines()` 遇末尾空行返回空串
+- 文件被手动编辑过可能有空行
+- 空字符串传给 `json.loads` 会崩
+
+`line.strip()` 是**防御性容错**，防止意外空行导致 JSON 解析崩。
+
+**为什么用 `read_text()` 一次性读**：收件箱通常很小（一次 send 加一行），内存无压力，逻辑简单。
+
+**列表推导式**：比 for 循环更简洁更快，是 Python 惯用法。
+
+#### 与另外两个读方法的对比
+
+| 方法 | 加锁 | 修改状态 | 返回值 | 使用场景 |
+|---|---|---|---|---|
+| `peek(agent)` | 自加 | ❌ 只观察 | `bool` | 主线程非阻塞判断"有没有消息" |
+| `read_inbox(agent)` | 自加 | ✅ 读完删除 | `list[dict]` | 消费者主动拉取 |
+| **`_read_unlocked(agent)`** | ❌ 外部持锁 | ✅ 读完删除 | `list[dict]` | 内部私有原语，被上面两者和 `wait_for_messages` 复用 |
+
+**分层设计**：`_read_unlocked` 是**最底层原语**（只做核心动作），`read_inbox` 和 `wait_for_messages` 是**上层组合**（加锁 + 等待 + 复用原语）。**"底层无锁 + 上层加锁"**的经典分层模式。
+
+#### 潜在改进点
+
+- **`read_text(encoding="utf-8")` 显式指定编码**：`send` 用了 utf-8，读时也显式指定更严谨（避免 Windows 默认 CP1252）
+- **用 try/except 替代 exists()**：极端并发下 `exists()` 后到 `read_text()` 之间可能被别的进程删除；但 s13 场景基本无影响
+
+#### 关键设计要点
+
+| # | 设计 | 目的 |
+|---|---|---|
+| 1 | 方法名 `_read_unlocked` | 命名契约：`_` 私有 + `_unlocked` 不加锁 |
+| 2 | `inbox.exists()` 前置检查 | "无消息"不算异常，用条件判断 |
+| 3 | `read_text().splitlines()` 一次读 | 简单直接，收件箱小无压力 |
+| 4 | `if line.strip()` 空行过滤 | 防御性容错 |
+| 5 | 列表推导式 | Pythonic，简洁快速 |
+| 6 | `inbox.unlink()` 删文件 | 破坏性读核心，exactly-once + 无状态 |
+| 7 | 无锁版本 + 上层组合 | 允许 `wait_for_messages` 复用 |
+
+### 一句话总结
+
+`_read_unlocked` 是 `MessageBus` **"破坏性读取"的最底层原语**——**7 行代码实现"检查文件存在 → 一次性读入 → 空行过滤 → JSON 解析 → 删除文件 → 返回列表"**。方法名 `_unlocked` 后缀是**并发编程的锁契约命名惯例**（"我不加锁，请外部持锁调用"），让上层 `read_inbox`（自加锁）和 `wait_for_messages`（已持锁）都能**复用同一段核心逻辑**。核心创新在 `inbox.unlink()` ——**读完即删的破坏性读**，用文件系统的原子删除实现了 exactly-once delivery，避免了传统消息队列需要维护"已读指针"的复杂性。这是**基础设施代码"简洁即强大"的典范**——把复杂问题（并发通信）用最少的代码和最简单的机制（文件系统）解决。
+
+---
+
+## 13. s16 Workflow Runtime 解决什么问题（举例讲透）
+
+### 用户
+
+> 举例解释 workflow runtime 解决什么问题？（选中 s16_workflow_runtime/README.zh.md 全文）
+
+### 助手
+
+#### 一句话回答
+
+**s16 解决"多 agent 编排的重复劳动、稳定性和中断恢复"三大痛点**——把由多次 agent 调用组成的**固定业务流程**，从"依赖对话历史+模型每次凭直觉安排步骤"升级为"**代码写死编排 + 磁盘 journal 记录进度 + 结构化输出保证接口**"的可靠工作流。
+
+#### 用一个具体例子把问题讲透
+
+**任务**：agent 做代码审查，标准流程是：
+
+1. 从 4 个维度审查代码（安全 / 性能 / 可读性 / 逻辑）
+2. 每个维度找可疑点 findings
+3. 每个 finding 独立做对抗性验证（排除误报）
+4. 汇总真实问题
+
+#### 方案 A：纯 s01~s15 主循环做法（模型驱动）
+
+```
+turn 1: 模型 → 看安全 → 得发现 A
+turn 2: 模型 → 看性能 → 得发现 B
+...
+turn 4: 模型 → 验证 A
+turn 5: 模型 → 验证 B
+...
+turn 20+: 汇总
+```
+
+**4 个痛点**（README 直接列出的 3 个 + 1 个）：
+
+| 痛点 | 具体表现 |
+|---|---|
+| **① 串行等待** | 4 个维度一个一个查，明明可以并行 |
+| **② 输出结构漂浮** | 模型每次输出格式都不一样，下游代码接不住 |
+| **③ 无法续跑** | 跑到 15 轮时中断，前 14 轮全作废 |
+| **④ 步骤靠对话历史撑** | 步骤顺序在 messages[] 里，上下文一压缩就丢 |
+
+#### 方案 B：s16 workflow 做法
+
+把固定流程写成代码保存起来：
+
+```python
+async def sample_workflow(ctx, args):
+    ctx.phase("Review")
+    changes = args.get("changes", "")
+
+    async def audit(_v, dimension, _i):
+        return await ctx.agent(
+            f"检查{dimension}:{changes}",
+            schema=FINDINGS_SCHEMA, label=f"audit:{dimension}"
+        )
+
+    async def verify(audited, dimension, _i):
+        ctx.phase("Verify")
+        verdicts = await ctx.parallel([                     # 每条 finding 并行验证
+            (lambda f=f: ctx.agent(f"验证:{f}", schema=VERDICT_SCHEMA))
+            for f in audited["findings"]])
+        return {"confirmed": [...]}
+
+    results = await ctx.pipeline(DIMENSIONS, audit, verify)  # 4 维度并行走 audit→verify
+    return {"confirmed": [...]}
+```
+
+模型只需**一次 tool_use**：`{"name": "Workflow", "input": {"name": "review-changes", "args": {...}}}`
+
+#### 3 个痛点如何被解决
+
+**① 并行 vs 串行 —— `pipeline` 和 `parallel` 原语**
+
+```
+方案 A (串行,假设每次 10 秒 × 20 轮 = 200 秒):
+安全 → 性能 → 可读 → 逻辑 → 验证 A → 验证 B → ...
+
+方案 B (pipeline 4 路并行,约 30-40 秒):
+安全 → 验证发现
+性能 → 验证发现       ← 4 维度同时推进
+可读 → 验证发现
+逻辑 → 验证发现
+```
+
+README 关键定义：**"item A 跑到第 3 阶段时，item B 可能还在第 1 阶段"**——不同 item 不等齐，各自推进。
+
+**② 输出结构稳定 —— schema 校验 + 一次重试**
+
+```python
+run = await asyncio.to_thread(self.runner.run, prompt, schema, label)
+result = run.value
+if schema is not None:
+    ok, err = SimpleJsonSchema(schema).validate(result)
+    if not ok:
+        retry = await asyncio.to_thread(
+            self.runner.run, prompt + "\n\n返回合法的 JSON。", schema, label)
+        result = retry.value
+```
+
+**强制子 agent 输出 JSON，不符合自动重试一次**。下游代码 `for f in audited["findings"]:` 直接遍历，不用解析自然语言。
+
+**③ 可恢复 —— journal + resume_from_run_id（最核心创新）**
+
+每次 `agent()` 完成后立即追加到磁盘 journal：
+
+```
+.runtime/run_20260828_001.journal.jsonl
+──────────────────────────────────────
+{"key": "agent-1234567890", "value": {"findings": [...]}}   ← 安全审查
+{"key": "agent-2345678901", "value": {"findings": [...]}}   ← 性能审查
+                                        ← Ctrl+C 中断!
+```
+
+续跑时用**内容哈希**当 key（不是计数器）：
+
+```python
+def key(self, kind, label, prompt, schema):
+    basis = f"{kind}|{label}|{prompt}|{json.dumps(schema, sort_keys=True)}"
+    return f"{kind}-{_stable_hash(basis) % 10**10:010d}"
+
+cached = self.journal.cached(key)
+if cached is not MISS:
+    return cached          # ← 命中!直接返回,不重新调 LLM
+```
+
+**关键**：key 不能用计数器（parallel/pipeline 里完成顺序不定，两次跑会错位）。用**调用内容哈希**（prompt+schema+label），跨运行稳定。
+
+**具体演示**：
+
+```
+初次运行 → 4 轮 audit 完成后 Ctrl+C
+runId = run_20260828_001
+
+python s16_workflow_runtime/code.py resume
+────────────────────────────
+[Review] audit:安全 → cached (0 秒 0 token)   ← 命中
+[Review] audit:性能 → cached (0 秒 0 token)   ← 命中
+[Verify] verify:xxx → 重新跑                    ← 从这继续
+```
+
+README 结尾原话：**"续跑命中全部缓存时显示 agents=0 tokens=0"**——无损续跑省时省钱。
+
+#### 完整对比表
+
+| 维度 | s01~s15 主循环 | s16 Workflow |
+|---|---|---|
+| 谁决定下一步 | 模型每轮决定 | 脚本代码预先写死 |
+| 步骤记录 | messages[]（易丢） | journal.jsonl（持久） |
+| 并行能力 | 无 | parallel + pipeline |
+| 输出结构 | 模型自由 | schema 强制校验 + 重试 |
+| 中断恢复 | 从头 | runId + journal 缓存 |
+| tool_use 次数 | 20+ 轮 | **1 次** |
+| 中间结果 | 塞 messages 污染上下文 | 存变量,不进历史 |
+
+#### 什么时候用 s16？什么时候不用？
+
+**用 s16**：
+- ✅ 重复性任务（代码审查、批量翻译、数据分析）
+- ✅ 流程固定（步骤和依赖执行前已知）
+- ✅ 可并行
+- ✅ token 消耗大，重跑代价高
+
+**不用 s16**：
+- ❌ 探索性任务（调 bug，每步依赖发现）
+- ❌ 单次任务（一次调用够了）
+- ❌ 流程需要 LLM 动态决策（决策点太多写不进代码）
+
+#### Harness 分工哲学的深化
+
+回到 s13 讨论过的核心哲学：
+
+```
+LLM 层 ← 语义决策 (该做什么)
+Harness 层 ← 工程确定性 (怎么做)
+```
+
+**s16 深化**：LLM 只需决定"用哪个 workflow + 参数"，Harness 负责一切执行（并发调度、schema 校验、断点续跑、进度上报、任务生命周期）。
+
+README 结尾点破：**"s06 的子 agent 是模型临场派一次；s16 把编排写成可续跑的宿主代码。"**
+
+### 一句话总结
+
+**s16 Workflow Runtime 解决的问题** = 让"重复的固定流程"从"每次都靠 LLM 现场重新规划"变成"一次写死+可靠执行"。用 `pipeline/parallel` 解决**并行等待**痛点，用 `schema` 校验解决**输出漂浮**痛点，用 `journal + resume_from_run_id + 稳定 key` 解决**中断丢失**痛点。核心思想：**"模型决定单步（哪个 workflow + 什么参数），脚本决定编排（步骤 + 并发 + 恢复策略）"**——把 LLM 的语义能力和工程代码的确定性执行力**分而治之**。适合代码审查、批量翻译这种"步骤已知+需要并行+跑得贵不能白跑"的重复任务。
+
+---
+
+## 14. s15 → s16 演进 HTML 可视化图解
+
+### 用户
+
+> 给出一个 html，生动解释从 s15 到 s16 的转变过程。突出关键特性。方便理解
+
+### 助手
+
+创建了 [s15-to-s16-evolution.html](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/.chatlogs/s15-to-s16-evolution.html)，一个信息饱满的暗色科技风可视化页面。
+
+#### HTML 结构（8 大板块）
+
+1. **顶部渐变标题 + 章节导航链**（s01 → … → s15 → **s16** → s17）
+2. **一句话对比卡片**（左 s15 蓝 vs 右 s16 橙，中间脉动箭头动画）
+3. **三大痛点故事**：代码审查场景 + 20 轮串行 timeline + turn 15 崩溃震动动画 + 红色 lost banner
+4. **s16 三大解法可视化**：
+   - pipeline 4×4 网格（audit → verify 并行推进）
+   - schema 校验前后对比代码
+   - resume 动画：初次运行中断 → resume 时 audit 块变金色 💾 显示 "0 秒"
+5. **6 大关键机制卡片**（悬停变色）：Workflow 工具 / 编排原语 / schema 校验 / journal / 稳定 key / 事件流
+6. **完整对照表**（9 个维度对比）
+7. **分层哲学**（三层堆叠图 LLM/编排/Harness，s16 加了中间那层）
+8. **使用建议**（左绿✅ 右红❌ 双栏对照）
+
+#### 关键视觉设计
+
+- **配色语义化**：s15 蓝色 `#58a6ff`，s16 橙色 `#f78166`，高亮金 `#ffd33d`
+- **动效**：中间箭头 `pulse` 呼吸、崩溃轮次 `shake` 震动、卡片悬停浮起
+- **信息饱满**：所有 3 大痛点、6 大机制、9 项对比、2 类使用场景一次说清
+- **代码块**：真实 Python 代码带语法高亮（关键字/字符串/注释着色）
+
+#### 核心突出的关键特性
+
+- **s16 不替换 s15**——只是工具池里多出一个 `Workflow` 工具
+- **一次 tool_use 跑完整套编排**（相比 s15 的 20+ 轮）
+- **`pipeline` 不等齐**："item A 跑到 stage 3 时，item B 可能还在 stage 1"
+- **稳定内容哈希 key**：不是计数器，两次跑能精准对上
+- **agents=0 tokens=0**：命中缓存完全零成本
+- **分层哲学的深化**：s15 承担基础执行确定性 → s16 承担编排级确定性
+
+打开方式：直接双击 `.chatlogs/s15-to-s16-evolution.html` 或用浏览器打开。
+
+---
+
+## 15. s17 Goal Loop 讲什么：独立判断器决定 agent 是否真的完成
+
+### 用户
+
+> file:///Users/cxhui/Documents/学习文档/ai/learn-claude-code/s17_goal_loop 解释 s17 在讲什么
+
+### 助手
+
+#### 一句话概括
+
+**s17 解决"agent 什么时候真正算做完"这个哲学问题**——把 s01 起就默认的"模型不调工具 = 任务完成"升级为"独立判断器读对话记录，判断目标条件是否真的达成"。README 副标题精准点破：
+
+> "模型不再调用工具，只代表这一轮想停；目标是否完成，再交给一个独立判断器。"
+
+#### 从 s01 到 s16 的"停止条件"演进
+
+s17 之前所有课时的 agent loop 退出条件都是：
+
+```python
+while True:
+    response = llm.call(messages)
+    tool_calls = extract_tool_uses(response)
+    if not tool_calls:
+        return                          # ← 模型不调工具就退出
+    run_tools(tool_calls)
+```
+
+**问题**：这行代码把"模型这一轮没想调工具"和"任务已完成"划了等号。
+
+**漏洞场景**：
+
+| 场景 | 表面上 | 实际上 |
+|---|---|---|
+| 修 bug 到测试全绿 | 模型说"修好了" | 从没跑过测试或没绿 |
+| 完成 checklist 所有验收项 | 停在中间某项 | 后面还有 3 项没做 |
+| "单测通过且 lint 无错" | 跑完单测就停 | lint 完全没运行 |
+
+**s01~s16 的停止判断权全在主模型自己手里**。s17 说这不合适，要加一个**独立于主模型**的裁判。
+
+#### 核心机制：/goal 命令 + Stop hook
+
+**用户交互**：
+
+```
+/goal pytest tests/auth 退出码为 0，并且 lint 没有错误
+```
+
+**主循环关键改动（就几行）**：
+
+```python
+if tool_results:
+    messages.append({"role": "user", "content": tool_results})
+    continue
+
+# ★ 原来的 return 位置,现在插入 Goal 判断
+decision = await self.goal.evaluate_after_turn(self.messages)
+if decision.action == "block":
+    self.messages.append({"role": "user", "content": decision.reason})
+    continue                                     # ← 裁判说没完,继续下一轮
+return SessionResult(text=text, status=decision.action)
+```
+
+#### 两个模型分工
+
+```
+主模型 (干活)                        Goal 裁判 (独立判断)
+- 修代码、跑测试、调工具              - 独立 LLM 调用
+- 决定"这一轮要不要调工具"            - 只读:看对话历史
+                                    - 无工具:不能读文件不能跑测试
+       │                            - 输出 JSON: {ok, reason, impossible}
+       │ 主模型说停 → 触发 Goal Stop hook
+       ▼
+```
+
+**关键设计**：**裁判没有工具**。只能根据对话里已经写过的内容做判断：
+
+- 主模型跑了 pytest → 结果写进对话 → 裁判看到 → 通过
+- 主模型说"我修好了"但**从没跑过测试** → 对话里没证据 → 裁判拒绝
+
+裁判返回：
+
+```json
+{
+  "ok": false,
+  "reason": "对话中还没有出现 pytest 的退出码",
+  "impossible": false
+}
+```
+
+- `ok=true` → 完成退出
+- `ok=false` → 未完成，reason 塞回 messages，continue
+- `impossible=true` → 不可能达成，认输退出
+
+#### 想解决的 4 个具体痛点
+
+**痛点 1：模型"假装完成"**——裁判要求**证据在对话里**（测试结果、exit code、编译输出）。主模型 system prompt 明确要求"把命令和结果写进对话让裁判检查"。
+
+**痛点 2：多轮任务需要自我驱动**——裁判说 block → 自动 continue → 主模型不需要用户催就下一轮。agent 从"一问一答"变成"自主奔向目标"。
+
+**痛点 3：消息即状态**——裁判和主模型**共享同一份 messages[]**，裁判理由直接追加进对话。README 明确反对引入独立 CommandQueue：**"把它画进 Gate 会把'谁做决定'和'决定从哪条路送回来'混成一件事"**。
+
+**痛点 4：自动机制必须有出口**——Goal 本身没默认轮数限制，但保留两道**通用兜底**：
+
+1. 主循环全局 max_turns（`MAX_TURNS=20`）
+2. Stop hook 连续 block 次数上限
+
+达到上限时**把控制权还给用户，但不伪装成完成，也不主动清除目标**。判断器失败时同样原则：**停止自动续轮，保留目标，不能在无法判断时宣称成功**——安全性核心原则。
+
+#### 4 个核心部件
+
+| 部件 | 作用 |
+|---|---|
+| `GoalState` | 保存条件、判断次数、开始时间、最近 reason |
+| `PromptGoalEvaluator` | 独立 LLM 调用读对话返回 JSON 判断 |
+| `GoalController` | 设置/查看/清除 Goal，实现 Stop hook |
+| `AgentSession` | 在原来的退出位置接入 Goal 判断 |
+
+#### 三个 /goal 子命令
+
+```
+/goal <条件>       # 设置或替换目标
+/goal              # 查看状态(次数/时间/token/最近原因)
+/goal clear        # 清除(别名 stop/off/reset/none/cancel)
+```
+
+#### 好的完成条件 3 要素
+
+1. **结束状态**：最终要达到什么
+2. **验证方式**：用什么命令证明
+3. **限制条件**：不能破坏什么
+
+**坏例子**：`把代码弄好`（太模糊）
+
+**好例子**：
+
+```
+/goal 完成登录模块迁移，直到 pytest tests/auth 退出码为 0，
+      并且没有修改 tests/auth 之外的测试文件
+```
+
+#### 和后台任务/Workflow 的协作
+
+**痛点**：后台任务/workflow 异步跑。主模型停时后台没完，立即判断没意义。
+
+**解法**：Stop hook 返回 **`defer`**，保留目标，不调判断器。后台通过 `submit_background_result()` 把通知塞进 messages，主循环继续。
+
+**关键**：workflow 完成通知**没有特殊权限**——就是普通消息进对话，裁判根据实际结果判断。判断器不需要知道"是不是 workflow 通知"，只看内容。
+
+#### s16 vs s17 分工
+
+| 层级 | 关注 |
+|---|---|
+| **s16 Workflow** | "一批工作怎样执行" —— 步骤/并行/schema/恢复 |
+| **s17 Goal Loop** | "整件事情是否已完成" —— 结果是否满足最终要求 |
+
+两个机制**正交**。同宿主可同时用：workflow 跑完写结果进对话 → Goal 判断整个任务是否完成 → 没完成继续。
+
+#### 分层哲学再深化
+
+```
+LLM 层       ← 语义决策(该做什么、写什么代码)
+编排层 s16   ← 并发/journal/schema
+Harness 层   ← 工具/权限/记忆/团队/后台/cron
+──────────
+Goal 层 s17  ← 裁判(判断整体目标是否达成)  ★ 新增
+```
+
+**s17 独特之处**：它是这个分层里**第一个"审查主模型自己"的层**。之前所有层都为主模型服务，s17 是**监督主模型**。这是 agent 从"工具集"升级为"能自主奔向目标的智能体"的**质变点**。
+
+### 一句话总结
+
+**s17 Goal Loop 就是给 agent 装了一个"独立裁判"**——用户通过 `/goal <条件>` 声明目标，主循环退出条件从"模型不调工具"升级为"独立判断器读对话记录判断条件已达成"。裁判是**没有工具的只读 LLM**，只能根据对话里已出现的证据（命令输出、测试结果、编译日志）判断。未达成就把理由塞回 messages 让主模型自动 continue 下一轮。用**两道通用兜底**（全局 max_turns + 连续 block 上限）+ **判断器失败保留目标不伪装成功**的安全原则守住自动化边界。它和 s16 正交：s16 管"一批工作怎么高效跑完"，s17 管"整件事到底做没做完"——是全系列 agent 从"聊天工具"升级为"自主奔向目标的智能体"的**最后一块拼图**。
+
+---
+
 ## 附录：本次会话关键文件引用
 
 - [s12_cron_scheduler/code.py](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s12_cron_scheduler/code.py)
 - [s11_background_tasks/code.py](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s11_background_tasks/code.py)
+- [s13_agent_teams/code.py](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s13_agent_teams/code.py)
 - [s13_agent_teams/README.zh.md](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s13_agent_teams/README.zh.md)
+- [s15_integrated_harness/README.zh.md](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s15_integrated_harness/README.zh.md)
+- [s16_workflow_runtime/README.zh.md](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s16_workflow_runtime/README.zh.md)
+- [s17_goal_loop/README.zh.md](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/s17_goal_loop/README.zh.md)
+- [.chatlogs/s15-to-s16-evolution.html](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/.chatlogs/s15-to-s16-evolution.html)（本次生成的可视化图解）
 - [.chatlogs/chat-2026-08-27-kimi-k3-setup-and-s01-to-s09-qa.md](/Users/cxhui/Documents/学习文档/ai/learn-claude-code/.chatlogs/chat-2026-08-27-kimi-k3-setup-and-s01-to-s09-qa.md)（前一天的归档，s01~s11 内容）
 
 ---

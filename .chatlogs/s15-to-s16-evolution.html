@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>s15 → s16 演进图解 · Workflow Runtime 的诞生</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-alt: #1c2431;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --s15: #58a6ff;
+    --s16: #f78166;
+    --highlight: #ffd33d;
+    --good: #3fb950;
+    --bad: #f85149;
+    --accent: #a371f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.65;
+    padding: 40px 24px 80px;
+    min-height: 100vh;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  h1 {
+    font-size: 2.6em; text-align: center; margin-bottom: 8px;
+    background: linear-gradient(90deg, var(--s15), var(--s16));
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 800;
+  }
+  .subtitle {
+    text-align: center; color: var(--muted); font-size: 1.1em;
+    margin-bottom: 50px;
+  }
+
+  h2 {
+    font-size: 1.6em; margin: 40px 0 20px;
+    padding-left: 14px; border-left: 4px solid var(--accent);
+  }
+
+  /* ─── 核心对比卡片 ─── */
+  .compare-grid {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 24px;
+    align-items: stretch; margin-bottom: 40px;
+  }
+  .side {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px; position: relative;
+    transition: transform 0.2s;
+  }
+  .side:hover { transform: translateY(-4px); }
+  .side.s15 { border-top: 4px solid var(--s15); }
+  .side.s16 { border-top: 4px solid var(--s16); }
+  .side h3 {
+    font-size: 1.4em; margin-bottom: 6px;
+  }
+  .side.s15 h3 { color: var(--s15); }
+  .side.s16 h3 { color: var(--s16); }
+  .side .tagline {
+    color: var(--muted); font-size: 0.95em; margin-bottom: 20px;
+    font-style: italic;
+  }
+  .side ul { list-style: none; }
+  .side ul li {
+    padding: 10px 0 10px 26px; position: relative;
+    border-bottom: 1px dashed var(--border);
+  }
+  .side ul li:last-child { border-bottom: none; }
+  .side ul li::before {
+    content: ""; position: absolute; left: 4px; top: 18px;
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .side.s15 ul li::before { background: var(--s15); }
+  .side.s16 ul li::before { background: var(--s16); }
+
+  .arrow-mid {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 3em; color: var(--highlight);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); opacity: 0.8; }
+    50% { transform: scale(1.15); opacity: 1; }
+  }
+
+  /* ─── 痛点动画区 ─── */
+  .pain-story {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 30px; margin-bottom: 40px;
+  }
+  .pain-story h3 { margin-bottom: 18px; color: var(--highlight); }
+
+  .timeline {
+    display: flex; gap: 6px; margin-top: 16px;
+    padding: 20px 0; overflow-x: auto;
+  }
+  .turn {
+    flex: 0 0 100px;
+    background: var(--panel-alt); border-radius: 8px;
+    padding: 10px 8px; text-align: center; font-size: 0.85em;
+    border: 1px solid var(--border);
+    position: relative;
+  }
+  .turn.crash {
+    background: rgba(248, 81, 73, 0.15);
+    border-color: var(--bad);
+    animation: shake 0.5s ease-in-out;
+  }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-4px); }
+    75% { transform: translateX(4px); }
+  }
+  .turn-idx {
+    color: var(--muted); font-size: 0.75em; margin-bottom: 4px;
+  }
+  .turn .icon { font-size: 1.4em; display: block; margin: 4px 0; }
+  .lost-banner {
+    text-align: center; padding: 14px; margin-top: 12px;
+    background: rgba(248, 81, 73, 0.1); border: 1px solid var(--bad);
+    color: var(--bad); border-radius: 8px; font-weight: 600;
+  }
+
+  /* ─── s16 解法可视化 ─── */
+  .solution-story {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 30px; margin-bottom: 40px;
+  }
+  .solution-story h3 { color: var(--good); margin-bottom: 20px; }
+
+  .pipeline-viz {
+    display: grid; grid-template-columns: 100px repeat(4, 1fr);
+    gap: 8px; margin: 20px 0;
+  }
+  .pipe-label {
+    display: flex; align-items: center; color: var(--muted);
+    font-size: 0.9em; padding-right: 12px; justify-content: flex-end;
+  }
+  .pipe-cell {
+    background: var(--panel-alt); border: 1px solid var(--border);
+    padding: 12px 8px; text-align: center; border-radius: 6px;
+    font-size: 0.85em; position: relative;
+  }
+  .pipe-cell.audit { background: rgba(88, 166, 255, 0.15); border-color: var(--s15); }
+  .pipe-cell.verify { background: rgba(63, 185, 80, 0.15); border-color: var(--good); }
+  .pipe-cell.cached {
+    background: rgba(255, 211, 61, 0.15); border-color: var(--highlight);
+    color: var(--highlight);
+  }
+  .pipe-cell.cached::after {
+    content: "⚡ 0 秒"; position: absolute; bottom: -18px;
+    left: 50%; transform: translateX(-50%);
+    font-size: 0.7em; color: var(--highlight);
+  }
+
+  /* ─── 关键机制展示 ─── */
+  .mechanism-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 18px; margin-bottom: 40px;
+  }
+  .mech-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 4px solid var(--s16); border-radius: 8px;
+    padding: 20px; transition: all 0.2s;
+  }
+  .mech-card:hover {
+    border-left-color: var(--highlight);
+    background: var(--panel-alt);
+  }
+  .mech-icon {
+    font-size: 2em; margin-bottom: 10px;
+    display: block;
+  }
+  .mech-title {
+    font-weight: 700; margin-bottom: 8px; font-size: 1.15em;
+    color: var(--s16);
+  }
+  .mech-desc { color: var(--muted); font-size: 0.95em; }
+
+  /* ─── 代码块 ─── */
+  pre {
+    background: var(--panel-alt); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; overflow-x: auto;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 0.88em; margin: 16px 0;
+  }
+  code { color: #d2a8ff; }
+  .comment { color: var(--muted); font-style: italic; }
+  .keyword { color: #ff7b72; }
+  .string { color: #a5d6ff; }
+  .func { color: #d2a8ff; }
+
+  /* ─── 表格 ─── */
+  table {
+    width: 100%; border-collapse: collapse; margin: 20px 0;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  th, td {
+    padding: 12px 16px; text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--panel-alt); color: var(--highlight);
+    font-weight: 600;
+  }
+  tbody tr:hover { background: var(--panel-alt); }
+  td:first-child { font-weight: 600; color: var(--accent); }
+
+  /* ─── 哲学总结 ─── */
+  .philosophy {
+    text-align: center; padding: 40px; margin: 40px 0;
+    background: linear-gradient(135deg, rgba(88, 166, 255, 0.1), rgba(247, 129, 102, 0.1));
+    border: 1px solid var(--border); border-radius: 12px;
+  }
+  .philosophy .quote {
+    font-size: 1.5em; font-style: italic; color: var(--highlight);
+    margin-bottom: 16px; line-height: 1.5;
+  }
+  .philosophy .source { color: var(--muted); font-size: 0.9em; }
+
+  .layer-diagram {
+    display: grid; grid-template-columns: 1fr; gap: 4px;
+    max-width: 500px; margin: 24px auto;
+  }
+  .layer {
+    padding: 16px; text-align: center; border-radius: 6px;
+    font-weight: 600;
+  }
+  .layer.llm {
+    background: rgba(163, 113, 247, 0.2);
+    border: 1px solid var(--accent); color: var(--accent);
+  }
+  .layer.harness {
+    background: rgba(88, 166, 255, 0.15);
+    border: 1px solid var(--s15); color: var(--s15);
+  }
+  .layer.orchestration {
+    background: rgba(247, 129, 102, 0.15);
+    border: 1px solid var(--s16); color: var(--s16);
+  }
+
+  /* ─── 底部标记 ─── */
+  footer {
+    text-align: center; color: var(--muted); margin-top: 60px;
+    padding-top: 30px; border-top: 1px solid var(--border);
+    font-size: 0.9em;
+  }
+  .path-chain {
+    display: inline-flex; gap: 8px; align-items: center;
+    padding: 10px 20px; background: var(--panel);
+    border-radius: 20px; margin: 8px 4px;
+    border: 1px solid var(--border);
+  }
+  .path-chain .cur { color: var(--s16); font-weight: 700; }
+
+  /* 高亮盒 */
+  .callout {
+    background: rgba(255, 211, 61, 0.08);
+    border-left: 4px solid var(--highlight);
+    padding: 16px 20px; margin: 20px 0;
+    border-radius: 4px;
+  }
+  .callout strong { color: var(--highlight); }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <h1>s15 → s16 演进图解</h1>
+  <p class="subtitle">
+    从<strong style="color:var(--s15)">"多种机制，一个循环"</strong>
+    到<strong style="color:var(--s16)">"模型决定单步，脚本决定编排"</strong>
+  </p>
+
+  <div style="text-align:center;">
+    <span class="path-chain">
+      s01 → … → s14 → <strong style="color:var(--s15)">s15</strong> →
+      <span class="cur">s16</span> → s17
+    </span>
+  </div>
+
+  <!-- ─────────── 一句话对比 ─────────── -->
+  <h2>🎯 一句话理清两者</h2>
+  <div class="compare-grid">
+    <div class="side s15">
+      <h3>s15 · 集成宿主</h3>
+      <div class="tagline">"多种机制，一个循环"</div>
+      <ul>
+        <li>26 个工具挂在<strong>同一个 while True</strong></li>
+        <li>每一轮都由<strong>模型现场决定</strong>下次调什么工具</li>
+        <li>步骤记录在 <code>messages[]</code>，压缩就丢</li>
+        <li>hooks / 权限 / 记忆 / 团队 / 后台 / cron / MCP 全部就位</li>
+        <li>能处理<strong>探索性任务</strong>（下一步依赖上一步发现）</li>
+      </ul>
+    </div>
+
+    <div class="arrow-mid">➜</div>
+
+    <div class="side s16">
+      <h3>s16 · Workflow Runtime</h3>
+      <div class="tagline">"一次 tool_use，跑完一整套编排"</div>
+      <ul>
+        <li>新增一个 <code>Workflow</code> 工具，其他 25 个不变</li>
+        <li>把<strong>固定流程写死在脚本里</strong>，模型只填参数</li>
+        <li>进度写到 <code>journal.jsonl</code>，磁盘持久化</li>
+        <li>新增 <code>parallel</code> / <code>pipeline</code> / <code>phase</code> 并行原语</li>
+        <li>专治<strong>重复性任务</strong>（步骤已知、需并行、跑得贵）</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>关键洞察：</strong>
+    s16 <b>不是</b>替换 s15。它是<b>在 s15 之上加了一层编排</b>——
+    主循环还是那个 <code>while True</code>，Workflow 只是工具池里多出来的一个工具。
+    但这一个工具，把 agent 系统从"聊天工具"升级为"业务自动化引擎"。
+  </div>
+
+  <!-- ─────────── 三大痛点故事 ─────────── -->
+  <h2>😰 s15 遗留的 3 大痛点</h2>
+  <p style="color: var(--muted); margin-bottom: 20px;">
+    以<strong style="color:var(--highlight)">代码审查</strong>为例：4 个维度（安全 / 性能 / 可读 / 逻辑），每个维度找出问题后独立验证。
+  </p>
+
+  <div class="pain-story">
+    <h3>❌ s15 做法：模型逐轮驱动，串行 20+ 轮</h3>
+    <div class="timeline">
+      <div class="turn"><div class="turn-idx">turn 1</div><span class="icon">🔒</span>安全审查</div>
+      <div class="turn"><div class="turn-idx">turn 2</div><span class="icon">⚡</span>性能审查</div>
+      <div class="turn"><div class="turn-idx">turn 3</div><span class="icon">👁</span>可读审查</div>
+      <div class="turn"><div class="turn-idx">turn 4</div><span class="icon">🧠</span>逻辑审查</div>
+      <div class="turn"><div class="turn-idx">turn 5</div><span class="icon">✅</span>验证 A</div>
+      <div class="turn"><div class="turn-idx">turn 6</div><span class="icon">✅</span>验证 B</div>
+      <div class="turn"><div class="turn-idx">turn 7</div><span class="icon">…</span>…</div>
+      <div class="turn"><div class="turn-idx">turn 14</div><span class="icon">✅</span>验证 J</div>
+      <div class="turn crash"><div class="turn-idx">turn 15</div><span class="icon">💥</span>API 断了！</div>
+      <div class="turn"><div class="turn-idx">turn 16</div><span class="icon">?</span>?</div>
+      <div class="turn"><div class="turn-idx">turn 17</div><span class="icon">?</span>?</div>
+    </div>
+    <div class="lost-banner">💸 前 14 轮的 tokens 全部作废，只能从头再来</div>
+
+    <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;">
+      <div style="padding: 14px; background: rgba(248, 81, 73, 0.08); border: 1px solid var(--bad); border-radius: 6px;">
+        <strong style="color: var(--bad);">🐢 痛点 1：串行慢</strong><br>
+        <small style="color: var(--muted);">
+          4 维度明明可以并行，却一个个串着等
+        </small>
+      </div>
+      <div style="padding: 14px; background: rgba(248, 81, 73, 0.08); border: 1px solid var(--bad); border-radius: 6px;">
+        <strong style="color: var(--bad);">🌪 痛点 2：输出漂浮</strong><br>
+        <small style="color: var(--muted);">
+          模型每次输出格式都不一样，下游代码无法稳定解析
+        </small>
+      </div>
+      <div style="padding: 14px; background: rgba(248, 81, 73, 0.08); border: 1px solid var(--bad); border-radius: 6px;">
+        <strong style="color: var(--bad);">💔 痛点 3：不可恢复</strong><br>
+        <small style="color: var(--muted);">
+          中断即崩溃，无法续跑，钱和时间都白花
+        </small>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────── s16 解法可视化 ─────────── -->
+  <h2>✨ s16 的三大解法</h2>
+
+  <div class="solution-story">
+    <h3>✅ pipeline 并行 → 4 维度同时推进</h3>
+    <p style="color: var(--muted); margin-bottom: 8px;">
+      每个 item 独立走完所有 stage，<strong style="color:var(--good)">不等齐</strong>——A 跑到 stage 3 时，B 可能还在 stage 1。
+    </p>
+    <div class="pipeline-viz">
+      <div class="pipe-label">🔒 安全</div>
+      <div class="pipe-cell audit">audit</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+
+      <div class="pipe-label">⚡ 性能</div>
+      <div class="pipe-cell audit">audit</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+
+      <div class="pipe-label">👁 可读</div>
+      <div class="pipe-cell audit">audit</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+
+      <div class="pipe-label">🧠 逻辑</div>
+      <div class="pipe-cell audit">audit</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+    </div>
+    <p style="text-align:center; color:var(--good); margin-top:12px;">
+      ⏱ <strong>200 秒 → 30-40 秒</strong>，速度提升 5 倍以上
+    </p>
+  </div>
+
+  <div class="solution-story">
+    <h3>✅ schema 校验 → 强制结构化输出</h3>
+    <p style="color: var(--muted); margin-bottom: 12px;">
+      每个子 agent 只能返回符合 schema 的 JSON。不符合？<strong style="color:var(--good)">自动重试一次</strong>。
+    </p>
+<pre><span class="comment"># s15:模型自由发挥,下游正则抽字段</span>
+"我发现了 3 个安全问题:1. SQL 注入... 2. 弱密码..."   <span class="comment"># 🤯 谁来解析?</span>
+
+<span class="comment"># s16:强制 JSON schema</span>
+<span class="func">await</span> ctx.<span class="func">agent</span>(prompt, schema=FINDINGS_SCHEMA, label=<span class="string">"audit:安全"</span>)
+<span class="comment"># 返回:{"findings": [{"title": ..., "severity": "high"}, ...]}</span>
+<span class="comment"># 下游代码直接 for f in result["findings"]: 遍历,不用解析自然语言</span></pre>
+  </div>
+
+  <div class="solution-story">
+    <h3>✅ journal + resume → 断点续跑，无损恢复</h3>
+    <p style="color: var(--muted); margin-bottom: 12px;">
+      每次 <code>agent()</code> 完成后立即写磁盘 journal。用 <code>resume_from_run_id</code> 续跑，命中缓存的直接返回。
+    </p>
+
+    <p style="color: var(--muted); margin-top: 20px;">初次运行（中断在验证阶段）：</p>
+    <div class="pipeline-viz">
+      <div class="pipe-label">🔒 安全</div>
+      <div class="pipe-cell audit">audit ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell" style="background:rgba(248,81,73,0.15);border-color:var(--bad);color:var(--bad);">💥 Ctrl+C</div>
+
+      <div class="pipe-label">⚡ 性能</div>
+      <div class="pipe-cell audit">audit ✓</div>
+      <div class="pipe-cell verify">verify ✓</div>
+      <div class="pipe-cell" style="background:rgba(125,133,144,0.1);border-color:var(--muted);color:var(--muted);">未跑</div>
+      <div class="pipe-cell" style="background:rgba(125,133,144,0.1);border-color:var(--muted);color:var(--muted);">未跑</div>
+    </div>
+
+    <p style="color: var(--muted); margin-top: 20px;">
+      <code>python code.py resume</code> 续跑：
+    </p>
+    <div class="pipeline-viz">
+      <div class="pipe-label">🔒 安全</div>
+      <div class="pipe-cell cached">audit 💾</div>
+      <div class="pipe-cell cached">verify 💾</div>
+      <div class="pipe-cell cached">verify 💾</div>
+      <div class="pipe-cell verify">verify ✓ 新跑</div>
+
+      <div class="pipe-label">⚡ 性能</div>
+      <div class="pipe-cell cached">audit 💾</div>
+      <div class="pipe-cell cached">verify 💾</div>
+      <div class="pipe-cell verify">verify ✓ 新跑</div>
+      <div class="pipe-cell verify">verify ✓ 新跑</div>
+    </div>
+    <p style="text-align:center; color:var(--highlight); margin-top:24px;">
+      💾 <strong>agents=0 tokens=0</strong> — 命中缓存的调用完全不花钱不花时间
+    </p>
+  </div>
+
+  <!-- ─────────── 关键机制卡片 ─────────── -->
+  <h2>🔑 s16 的 6 大关键机制</h2>
+  <div class="mechanism-grid">
+    <div class="mech-card">
+      <span class="mech-icon">🎫</span>
+      <div class="mech-title">Workflow 工具</div>
+      <div class="mech-desc">
+        模型只提供 <code>name + args + resume_from_run_id</code>，
+        <strong>不能提交可执行代码</strong>。宿主 registry 只暴露白名单 workflow。
+      </div>
+    </div>
+
+    <div class="mech-card">
+      <span class="mech-icon">🎼</span>
+      <div class="mech-title">编排原语</div>
+      <div class="mech-desc">
+        <code>agent()</code> / <code>parallel()</code> /
+        <code>pipeline()</code> / <code>phase()</code> / <code>log()</code>
+        —— 只暴露少量能力，脚本<strong>不能读文件/跑 shell</strong>。
+      </div>
+    </div>
+
+    <div class="mech-card">
+      <span class="mech-icon">📋</span>
+      <div class="mech-title">JSON Schema 强校验</div>
+      <div class="mech-desc">
+        子 agent 输出必须匹配 schema。不匹配 → 自动重试一次 → 还不行就抛错。
+        <strong>把不确定性挡在编排层外</strong>。
+      </div>
+    </div>
+
+    <div class="mech-card">
+      <span class="mech-icon">📓</span>
+      <div class="mech-title">Journal 磁盘账本</div>
+      <div class="mech-desc">
+        每次 <code>agent()</code> 完成立即追加到 <code>.runtime/{runId}.journal.jsonl</code>，
+        <strong>flush 落盘</strong>，保证断电也不丢。
+      </div>
+    </div>
+
+    <div class="mech-card">
+      <span class="mech-icon">🔑</span>
+      <div class="mech-title">稳定内容哈希 key</div>
+      <div class="mech-desc">
+        用 <code>hash(kind + label + prompt + schema)</code> 作 key，
+        <strong>不用计数器</strong>——因为 parallel/pipeline 完成顺序不定，
+        计数器两次跑会错位。
+      </div>
+    </div>
+
+    <div class="mech-card">
+      <span class="mech-icon">📡</span>
+      <div class="mech-title">SDK 风格事件流</div>
+      <div class="mech-desc">
+        <code>task_started</code> → <code>task_progress*</code> →
+        <code>task_notification</code>。带 agent 数和 token 数，
+        方便进度条 / 观测 / 计费。
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────── 完整变更表 ─────────── -->
+  <h2>📊 s15 vs s16 · 完整对照</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>s15 Agent Harness 集成</th>
+        <th>s16 Workflow Runtime</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>主循环</td>
+        <td>单个、模型驱动</td>
+        <td>主循环不变；<strong style="color:var(--s16)">工具背后执行脚本编排</strong></td>
+      </tr>
+      <tr>
+        <td>谁决定下一步</td>
+        <td>模型逐轮决定</td>
+        <td>脚本预先写好编排流程</td>
+      </tr>
+      <tr>
+        <td>多 agent</td>
+        <td>s06 子 agent，一次性派</td>
+        <td>agent-runner 边界执行<strong>可续跑</strong>的调用</td>
+      </tr>
+      <tr>
+        <td>tool_use 次数</td>
+        <td>20+ 轮（每步一次）</td>
+        <td><strong style="color:var(--s16)">1 次</strong>（一次调用跑完全流程）</td>
+      </tr>
+      <tr>
+        <td>并行能力</td>
+        <td>❌ 无（一轮只能一个 tool_use）</td>
+        <td>✅ <code>parallel</code> + <code>pipeline</code></td>
+      </tr>
+      <tr>
+        <td>输出结构</td>
+        <td>模型自由发挥</td>
+        <td>schema 强制校验 + 一次重试</td>
+      </tr>
+      <tr>
+        <td>中间结果</td>
+        <td>塞 <code>messages</code> 污染上下文</td>
+        <td>存变量里，不进对话历史</td>
+      </tr>
+      <tr>
+        <td>中断恢复</td>
+        <td>❌ 从头再来</td>
+        <td>✅ <code>runId</code> + journal 缓存续跑</td>
+      </tr>
+      <tr>
+        <td>适合场景</td>
+        <td>探索性任务（下一步依赖上一步发现）</td>
+        <td>重复性固定流程（代码审查、批量翻译、多维分析）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ─────────── 哲学 ─────────── -->
+  <h2>💡 分层哲学的深化</h2>
+  <div class="philosophy">
+    <div class="quote">
+      "s06 的子 agent 是模型临场派一次；<br>
+      s16 把编排写成可续跑的宿主代码。"
+    </div>
+    <div class="source">— s16 README</div>
+
+    <div class="layer-diagram">
+      <div class="layer llm">🧠 LLM 层 · 语义决策（选哪个 workflow / 填什么参数）</div>
+      <div class="layer orchestration">🎼 编排层（s16 新增） · 并发调度 / journal / schema 校验</div>
+      <div class="layer harness">🛠 Harness 层（s15） · 工具 / hooks / 权限 / 记忆 / 团队 / 后台 / cron</div>
+    </div>
+
+    <p style="color: var(--text); margin-top: 20px;">
+      <strong>s15</strong> 让 harness 承担<strong>基础执行确定性</strong>；<br>
+      <strong>s16</strong> 让 harness 承担<strong>编排级确定性</strong>——
+      把"用什么顺序、并发多少、怎么恢复"这些原本靠模型直觉的决策，<br>
+      <strong style="color: var(--highlight)">下沉到脚本代码</strong>。
+    </p>
+  </div>
+
+  <!-- ─────────── 何时用 s16 ─────────── -->
+  <h2>🤔 什么时候用 s16？什么时候别用？</h2>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;">
+    <div style="padding: 20px; background: rgba(63, 185, 80, 0.08); border: 1px solid var(--good); border-radius: 8px;">
+      <h3 style="color: var(--good); margin-bottom: 12px;">✅ 用 s16 workflow</h3>
+      <ul style="list-style: none;">
+        <li style="padding: 6px 0;">📋 <strong>重复性任务</strong>：代码审查、批量翻译、批量数据分析</li>
+        <li style="padding: 6px 0;">🗺 <strong>流程已知</strong>：步骤和依赖执行前就确定</li>
+        <li style="padding: 6px 0;">🔀 <strong>可并行</strong>：多维度/多文件独立处理</li>
+        <li style="padding: 6px 0;">💸 <strong>跑得贵</strong>：token 消耗大，重跑代价高</li>
+      </ul>
+    </div>
+    <div style="padding: 20px; background: rgba(248, 81, 73, 0.08); border: 1px solid var(--bad); border-radius: 8px;">
+      <h3 style="color: var(--bad); margin-bottom: 12px;">❌ 别用 s16 workflow</h3>
+      <ul style="list-style: none;">
+        <li style="padding: 6px 0;">🔍 <strong>探索性任务</strong>：调 bug（每步依赖发现）</li>
+        <li style="padding: 6px 0;">⚡ <strong>单次任务</strong>："帮我写个函数" 一次调用够了</li>
+        <li style="padding: 6px 0;">🎲 <strong>动态决策多</strong>：需要 LLM 每步都判断分支</li>
+        <li style="padding: 6px 0;">📏 <strong>短流程</strong>：只有 1-2 步，编排开销大于收益</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    📚 归档主题：<code>learn-claude-code / s15 → s16 演进</code><br>
+    生成时间：2026-08-28 · 供 cxhui 参考学习<br>
+    &nbsp;<br>
+    参考文件：
+    <a href="../s15_integrated_harness/README.zh.md" style="color: var(--s15);">s15 README</a> ·
+    <a href="../s16_workflow_runtime/README.zh.md" style="color: var(--s16);">s16 README</a>
+  </footer>
+
+</div>
+</body>
+</html>
